@@ -51,6 +51,19 @@ def completion(request: Request) -> OpenAIServingCompletion | None:
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    # Codec v0.4 version-negotiation gate. Default-off; only fires when
+    # the deployment has CODEC_*_REQUIRED set and the client speaks below
+    # the floor. See spec/versions/v0.4.md § Version Compatibility Signaling.
+    from vllm.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
+
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
+
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
@@ -80,6 +93,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             generator,
             media_type=media_type,
             stream_format=request.stream_format,
+            client_version=client_version,
         )
     return StreamingResponse(content=generator, media_type=media_type)
 
@@ -111,6 +125,17 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 @with_cancellation
 @load_aware_call
 async def create_completion_codec(raw_request: Request):
+    # Codec v0.4 version-negotiation gate.
+    from vllm.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
+
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
+
     handler = completion(raw_request)
     if handler is None:
         raise NotImplementedError("The model does not support Completions API")
@@ -148,6 +173,7 @@ async def create_completion_codec(raw_request: Request):
         generator,
         media_type=media_type,
         stream_format=stream_format,
+        client_version=client_version,
     )
 
 
@@ -158,6 +184,29 @@ async def create_completion_codec(raw_request: Request):
 )
 async def codec_schema():
     return PlainTextResponse(content=PROTO_SCHEMA, media_type="text/plain")
+
+
+@router.get(
+    "/.well-known/codec/version-policy.json",
+    summary="Codec v0.4 deployment minimum-version policy",
+    description=(
+        "Pre-flight discovery doc per spec/WELL_KNOWN_DISCOVERY.md § "
+        "Version policy (v0.4+). Returns 404 when the deployment does "
+        "NOT mandate any v0.4 feature — that's the normal state for an "
+        "unrestricted deployment. Returns 200 with the policy doc when "
+        "any CODEC_*_REQUIRED env var is set."
+    ),
+)
+async def well_known_version_policy():
+    from fastapi.responses import JSONResponse
+    from fastapi.responses import Response as FastResponse
+
+    from vllm.entrypoints.codec_version import version_policy_document
+
+    doc = version_policy_document()
+    if doc is None:
+        return FastResponse(status_code=404)
+    return JSONResponse(doc)
 
 
 def attach_router(app: FastAPI):

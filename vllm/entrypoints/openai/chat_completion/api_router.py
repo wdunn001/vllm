@@ -53,6 +53,17 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    # Codec v0.4 version-negotiation gate. Default-off.
+    from vllm.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
+
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
+
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
@@ -82,6 +93,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             generator,
             media_type=media_type,
             stream_format=request.stream_format,
+            client_version=client_version,
         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")

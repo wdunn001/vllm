@@ -269,6 +269,7 @@ def wrap_streaming_response(
     background: Optional[BackgroundTasks] = None,
     extra_headers: Optional[dict[str, str]] = None,
     stream_format: Optional[str] = None,
+    client_version: Optional[str] = None,
 ) -> StreamingResponse:
     """Build a StreamingResponse with the right compression based on the
     client's Accept-Encoding header.
@@ -280,7 +281,13 @@ def wrap_streaming_response(
     ``stream_format`` is the request's ``stream_format`` field
     (``"msgpack"`` / ``"protobuf"`` / ``"json"``) and gates the zstd path
     via the dict registry — see ``negotiate_encoding``.
+
+    ``client_version`` is the request's ``Codec-Client-Version``. When set,
+    Codec-* response headers are filtered to that version's floor per
+    `spec/versions/v0.4.md § Graceful downgrade`.
     """
+    from vllm.entrypoints.codec_version import filter_codec_headers
+
     encoding = negotiate_encoding(accept_encoding, stream_format=stream_format)
     headers: dict[str, str] = {"Vary": "Accept-Encoding"}
     if extra_headers:
@@ -311,6 +318,10 @@ def wrap_streaming_response(
         headers["Content-Encoding"] = "gzip"
     else:
         body = body_stream
+
+    # Graceful downgrade — strip v0.4+ headers for older clients.
+    if client_version is not None:
+        headers = filter_codec_headers(headers, client_version)
 
     return StreamingResponse(
         body,
