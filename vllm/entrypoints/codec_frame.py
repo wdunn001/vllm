@@ -23,10 +23,28 @@ Proto schema (for client-side code generation)
 -----------------------------------------------
 """
 
+import array
+import os
 import struct as _struct
 from collections.abc import Sequence
+from typing import Union
 
 import msgspec as _msgspec
+
+# v0.5 #77 (T1.4 OpenAI-bypass): when CODEC_OPENAI_BYPASS=1, the encoder
+# accepts numpy / array.array / bytes ids directly so the upstream
+# OpenAI-JSON-SSE PyLong-boxing path can be elided. Wire bytes are
+# byte-identical to the default path. Mirrors the sglang fork's change.
+_OPENAI_BYPASS = os.environ.get("CODEC_OPENAI_BYPASS", "0") == "1"
+
+try:
+    import numpy as _np  # type: ignore[import-untyped]
+    _HAVE_NUMPY = True
+except ImportError:  # pragma: no cover
+    _np = None
+    _HAVE_NUMPY = False
+
+IdsLike = Union[Sequence[int], "array.array", bytes, "_np.ndarray"]
 
 # ── msgspec msgpack ────────────────────────────────────────────────────────────
 
@@ -34,8 +52,25 @@ _mp_encoder = _msgspec.msgpack.Encoder()
 _mp_decoder = _msgspec.msgpack.Decoder()
 
 
+def _normalise_ids_to_list(ids: IdsLike) -> list[int]:
+    """Coerce IdsLike to a plain list[int]. See sglang fork for rationale."""
+    if isinstance(ids, list):
+        return ids
+    if _HAVE_NUMPY and isinstance(ids, _np.ndarray):
+        return ids.tolist()
+    if isinstance(ids, array.array):
+        return ids.tolist()
+    if isinstance(ids, (bytes, bytearray, memoryview)):
+        if _HAVE_NUMPY:
+            return _np.frombuffer(bytes(ids), dtype="<u4").tolist()
+        b = bytes(ids)
+        return [int.from_bytes(b[i:i + 4], "little") for i in range(0, len(b), 4)]
+    # Fall back to the Sequence path.
+    return list(ids)
+
+
 def encode_msgpack(
-    ids: Sequence[int],
+    ids: IdsLike,
     done: bool,
     finish_reason: str | None = None,
     tool_calls: Sequence[dict] | None = None,
@@ -46,8 +81,14 @@ def encode_msgpack(
     of {"arguments_json": str, "name"?: str, "id"?: str}. Emitted under
     the "tool_calls" map key only when non-empty so frames without a
     detected tool call stay byte-identical to the pre-watcher path.
+
+    v0.5: ids accepts numpy / array.array / bytes (LE uint32) in addition
+    to Sequence[int]. Wire bytes are byte-identical regardless of input
+    shape. See CODEC_OPENAI_BYPASS env var + Codec/docs/engine-fork-tasks
+    /v0.5-rollout.md § Task #77.
     """
-    obj: dict = {"ids": list(ids), "done": done}
+    ids_list = ids if isinstance(ids, list) else _normalise_ids_to_list(ids)
+    obj: dict = {"ids": ids_list, "done": done}
     if finish_reason is not None:
         obj["finish_reason"] = finish_reason
     if tool_calls:
@@ -116,15 +157,20 @@ def _encode_tool_call_msg(call: dict) -> bytes:
 
 
 def encode_protobuf_frame(
-    ids: Sequence[int],
+    ids: IdsLike,
     done: bool,
     finish_reason: str | None = None,
     tool_calls: Sequence[dict] | None = None,
 ) -> bytes:
-    """Raw protobuf bytes for a CodecFrame (no length prefix)."""
+    """Raw protobuf bytes for a CodecFrame (no length prefix).
+
+    v0.5: ids accepts numpy / array.array / bytes (LE uint32) in addition
+    to Sequence[int]. Mirrors encode_msgpack.
+    """
     parts: list[bytes] = []
-    if ids:
-        packed = b"".join(_varint(i) for i in ids)
+    ids_list = ids if isinstance(ids, list) else _normalise_ids_to_list(ids)
+    if ids_list:
+        packed = b"".join(_varint(i) for i in ids_list)
         parts += [b"\x0a", _varint(len(packed)), packed]  # field 1, wt=2
     parts += [b"\x10", b"\x01" if done else b"\x00"]       # field 2, wt=0
     if finish_reason is not None:
@@ -140,7 +186,7 @@ def encode_protobuf_frame(
 
 
 def encode_protobuf(
-    ids: Sequence[int],
+    ids: IdsLike,
     done: bool,
     finish_reason: str | None = None,
     tool_calls: Sequence[dict] | None = None,
