@@ -19,6 +19,12 @@ from vllm.entrypoints.codec_agent import (
     parse_tool_call,
     resolve_marker_id,
 )
+from vllm.entrypoints.codec_dispatcher import (
+    CODEC_BOLT_ON_DISPATCH,
+    ToolRegistry,
+    dispatch_call,
+    reinject_ids_into_context,
+)
 from vllm.entrypoints.codec_frame import encode_frame
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -1068,6 +1074,16 @@ class OpenAIServingChat(OpenAIServing):
                 )
 
         next_call_seq = 1
+
+        # v0.5 #87: bolt-on tool dispatcher. When the flag is set AND a
+        # ToolWatcher is active, load the tool registry once per stream
+        # and dispatch detected tool calls in-engine, reinjecting the
+        # tool's response_ids back into the stream.
+        dispatcher_registry: ToolRegistry | None = None
+        if CODEC_BOLT_ON_DISPATCH and watcher is not None:
+            tokenizer_hash = getattr(self, "_codec_tokenizer_map_hash", "")
+            dispatcher_registry = ToolRegistry.from_env(tokenizer_hash)
+
         try:
             async for res in result_generator:
                 if not res.outputs:
@@ -1097,6 +1113,26 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         next_call_seq += 1
                         wire.append(ev.to_wire_dict())
+
+                        # v0.5 #87: in-engine dispatch when registered.
+                        if dispatcher_registry is not None and ev.name:
+                            tool = dispatcher_registry.get(ev.name)
+                            if tool is not None and tool.mode == "dispatch":
+                                try:
+                                    result = dispatch_call(
+                                        tool,
+                                        arguments_json=ev.arguments_json,
+                                        call_id=ev.id or make_call_id(next_call_seq),
+                                    )
+                                    if not result.is_error and result.response_ids:
+                                        passthrough_ids = reinject_ids_into_context(
+                                            passthrough_ids, result.response_ids,
+                                        )
+                                except Exception as e:
+                                    logger.warning(
+                                        "codec_dispatcher: dispatch_call(%s) failed: %s",
+                                        ev.name, e,
+                                    )
                     tool_calls_wire = wire
 
                 yield encode_frame(
